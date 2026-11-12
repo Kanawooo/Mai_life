@@ -741,6 +741,17 @@ class MaiLifePlugin(MaiBotPlugin):
         except Exception as exc:
             return {"success":False,"error":f"{type(exc).__name__}: {exc}"[:200]}
 
+    @staticmethod
+    def _photo_context_from_payload(payload:dict[str,Any])->dict[str,str]:
+        """照片只共享当前四项背景，不暴露日记、用户关系或未来日程。"""
+        state=payload.get("state") or {}; node=((payload.get("context") or {}).get("current") or {})
+        return {
+            "activity":str(state.get("current_activity") or node.get("summary") or "")[:600],
+            "location":str(state.get("current_location") or node.get("location") or "")[:160],
+            "weather":EnvironmentService.weather_text(payload.get("weather") or {})[:160],
+            "mood":_mood_label(float(state["mood_valence"])) if state.get("mood_valence") is not None else "",
+        }
+
     async def _submit_persona_ref_draw(self,session_id:str,payload:dict[str,Any]|None,day:str="")->bool:
         """按默认角色参考图直发图生图：参考图 Base64 + 当前日程场景交给 drawpic，成品自动发进会话。
 
@@ -773,10 +784,23 @@ class MaiLifePlugin(MaiBotPlugin):
                 return False  # 原任务仍在流程中：本轮回退文字引导，不创建第二个任务
             self._persona_ref_request.pop(session_id,None)  # 确认从未受理：允许重新提交
         request_id=f"refdraw-{uuid.uuid4().hex[:24]}"
+        extra={}
+        try:
+            async with asyncio.timeout(3):
+                capabilities=await self.ctx.api.call("maimai-drawpic-plugin.drawpic_models",version="1")
+            if isinstance(capabilities,dict) and (capabilities.get("features") or {}).get("persona_scene_context") is True:
+                extra["persona_scene_context"]={**self._photo_context_from_payload(payload),"source_role":"identity"}
+                prompt=(f"{self._bot_name}此刻的手机生活照片，按随请求提供的当前生活背景安排画面。"
+                        "保持人物身份，动作、表情与拍摄角度自然，画面不出现文字水印。")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 能力探测尚未提交绘图；旧绘图插件仍使用原有的文字场景和 API 参数。
+            self.ctx.logger.debug("[MaiLife] 绘图场景扩展不可用，沿用原契约: error_type=%s",type(exc).__name__)
         try:
             response=await self.ctx.api.call("maimai-drawpic-plugin.drawpic_submit_v2",version="2",
                                              prompt=prompt,stream_id=session_id,source_images=images,
-                                             task_type="edit_image",request_id=request_id)
+                                             task_type="edit_image",request_id=request_id,**extra)
         except Exception as exc:
             # RPC 结果未知 ≠ 未受理：登记未确认状态供下轮查询，不当场判定失败。
             if day:self._persona_ref_request[session_id]={"day":day,"request_id":request_id,"state":"unconfirmed"}
@@ -2300,6 +2324,13 @@ class MaiLifePlugin(MaiBotPlugin):
         if not self._ready:return {}
         assert self._schedule and self._env
         return await self._schedule.context(self._env.now())
+
+    @API(name="get_photo_context",description="只读获取当前照片背景：活动、地点、缓存天气和心情，不生成或发送照片",version="1",public=True)
+    async def api_get_photo_context(self,**kwargs:Any)->dict[str,str]:
+        if not (self._ready and self._store and self._schedule and self._env):return {}
+        state,weather,context=await asyncio.gather(
+            self._store.get_state(),self._store.get_weather(),self._schedule.context(self._env.now()))
+        return self._photo_context_from_payload({"state":state,"weather":weather,"context":context})
 
     @API(name="get_schedule",description="获取麦麦今日日程",version="1",public=True)
     async def api_get_schedule(self,day:str="",**kwargs:Any)->list[dict[str,Any]]:
